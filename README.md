@@ -74,14 +74,35 @@ err := config.LoadViperConfig(config.ViperConfig{
 import "github.com/bpshou/tituskit/core/crontab"
 
 c := crontab.NewCron()
-c.AddFunc("*/5 * * * * *", func() {
+
+// AddFunc 直接返回 error：表达式写错时立刻失败，
+// 不要忽略它，否则会留下一个永远不触发的任务。
+id, err := c.AddFunc("*/5 * * * * *", func() {
     fmt.Println("每5秒执行")
 })
+if err != nil {
+    log.Fatalf("register cron job failed: %v", err)
+}
 c.Start()
 
-// 解析表达式，获取下次执行时间
+// NextRun 回读任务的下次执行时间；id 无效、未注册或调度器未启动时 ok 为 false。
+if next, ok := crontab.NextRun(c, id); ok {
+    fmt.Println("next run:", next.Format(time.DateTime))
+}
+
+// 解析表达式，获取接下来 n 个执行时间
 parser := crontab.NewCronParser()
-times, _ := crontab.NextTimeList(parser, "0 30 * * * *", 5)
+times, _ := parser.NextTimeListN("0 30 * * * *", 3)  // []time.Time
+dates, _ := parser.NextDateListN("0 30 * * * *", 3)  // []string（time.DateTime）
+
+// 不传次数时固定返回 DefaultNextCount（5）个
+times, _ = parser.NextTimeList("0 30 * * * *")
+
+// 语法合法但永远推算不出时间的表达式（如 2 月 31 日）会返回
+// crontab.ErrNoNextTime，可用 errors.Is 判定，不会静默返回 0001-01-01。
+if _, err := parser.NextTimeListN("0 0 0 31 2 *", 3); errors.Is(err, crontab.ErrNoNextTime) {
+    log.Printf("该表达式永远不会触发: %v", err)
+}
 ```
 
 ### DB
