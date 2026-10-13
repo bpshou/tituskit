@@ -18,35 +18,56 @@ go get github.com/bpshou/tituskit
 | [`core/config`](#config) | 配置文件加载（Viper） |
 | [`core/crontab`](#crontab) | 定时任务调度（秒级精度） |
 | [`core/db`](#db) | 数据库连接（MySQL/PostgreSQL）与代码生成 |
+| [`core/deploader`](#deploader) | 依赖模块拓扑加载 |
 | [`core/log`](#log) | 结构化日志 + OpenTelemetry 链路追踪 |
 | [`core/notice`](#notice) | 桌面通知 |
 | [`core/rester`](#rester) | HTTP 客户端（Resty v3） |
 | [`core/tmpl`](#tmpl) | Go 模板引擎（Sprig 函数） |
+| [`gin/resp`](#ginresp) | Gin 统一响应与 OpenAI 兼容错误体 |
 
 ## 使用示例
 
 ### Auth
 
-JWT 令牌生成与解析，支持泛型自定义 Claims。
+JWT 令牌生成与解析，签名算法固定为 HS256，解析时锁定算法并校验 issuer。
 
 ```go
 import "github.com/bpshou/tituskit/core/auth"
 
-// 生成令牌
-jwt := auth.NewJwt("my-secret-key")
-token, err := jwt.GenerateJwtToken("user-001", "app", 24*time.Hour)
+// 创建签发/解析器
+j := auth.NewJwt(auth.Jwt[any]{
+    Issuer:     "my-app",
+    SigningKey: []byte("my-secret-key"),
+})
+
+// 生成令牌（audience 是 []string）
+token, err := j.GenerateJwtToken("user-001", []string{"app"}, 24*time.Hour)
 
 // 解析令牌
-subject, audience, err := jwt.ParseJwtToken(token)
+subject, audience, err := j.ParseJwtToken(token)
 
 // 使用自定义 Claims
 type MyClaims struct {
     jwt.RegisteredClaims
     Role string `json:"role"`
 }
-token, err = jwt.GenerateJwtTokenWithClaims(&MyClaims{
-    Role: "admin",
-}, "user-001", "app", 24*time.Hour)
+
+custom := auth.NewJwt(auth.Jwt[MyClaims]{
+    Issuer:     "my-app",
+    SigningKey: []byte("my-secret-key"),
+})
+
+claims := &MyClaims{
+    RegisteredClaims: *custom.GetRegisteredClaimsDefault(24 * time.Hour),
+    Role:             "admin",
+}
+token, err = custom.GenerateJwtTokenWithClaims(claims)
+
+// 解析自定义 Claims，返回值可直接断言回 *MyClaims
+parsed, err := custom.ParseJwtTokenWithClaims(token, &MyClaims{})
+if got, ok := parsed.(*MyClaims); ok {
+    _ = got.Role
+}
 ```
 
 ### Config
@@ -59,10 +80,10 @@ import "github.com/bpshou/tituskit/core/config"
 config.ViperInitEnv()
 
 err := config.LoadViperConfig(config.ViperConfig{
-    Name:     "app",
-    FileType: "yaml",
-    Path:     "./configs",
-    Must:     true, // 加载失败则 panic
+    Name: "app",
+    Type: "yaml",
+    Path: "./configs",
+    Must: true, // 加载失败则 panic
 })
 ```
 
@@ -107,7 +128,8 @@ if _, err := parser.NextTimeListN("0 0 0 31 2 *", 3); errors.Is(err, crontab.Err
 
 ### DB
 
-GORM 数据库连接与代码生成。
+GORM 数据库连接与代码生成。config 传 nil 时使用默认配置（含基于 slog 的
+GORM 日志），连接池默认 10 空闲 / 100 最大连接 / 1 小时最大存活。
 
 ```go
 import "github.com/bpshou/tituskit/core/db"
@@ -118,9 +140,28 @@ mysql, err := db.NewMySQL("user:pass@tcp(127.0.0.1:3306)/dbname?charset=utf8mb4&
 // PostgreSQL
 pg, err := db.NewPostgreSQL("host=localhost user=postgres dbname=dbname sslmode=disable", nil)
 
-// 生成 Model 和 Query 代码
-db.GromGen(mysql, "./query")
+// 生成 Model 和 Query 代码：path 是输出根目录，
+// 传 "." 会得到 ./model 与 ./query。
+// 注意：底层 gorm.io/gen 失败时直接 panic，本函数同样以 panic 报告失败。
+db.GromGen(mysql, ".")
 ```
+
+### Deploader
+
+按依赖关系并发初始化模块。
+
+```go
+import "github.com/bpshou/tituskit/core/deploader"
+
+deploader.Load([]deploader.Module{
+    {Name: "config", Fn: func() { initConfig() }},
+    {Name: "db", Fn: func() { initDB() }, Deps: []string{"config"}},
+    {Name: "http", Fn: func() { initHTTP() }, Deps: []string{"config", "db"}},
+})
+```
+
+模块名重复、依赖了不存在的模块、依赖成环（含自依赖）都会直接 panic；
+成环不会退化成永久死锁。
 
 ### Log
 
@@ -129,15 +170,16 @@ db.GromGen(mysql, "./query")
 ```go
 import "github.com/bpshou/tituskit/core/log"
 
-// 创建 Logger
+// 创建 Logger：IoWriter 省略时默认写 os.Stdout
 logger := log.New(log.Config{
-    Level:  log.InfoLevel,
-    Format: log.JSON, // 或 log.Text
+    Level:    "info",
+    Format:   log.FormatJSON, // 或 log.FormatText
+    IoWriter: os.Stdout,
 })
 logger.Info("服务启动")
 
-// 初始化 OpenTelemetry
-shutdown, _ := log.InitTracer("my-service")
+// 初始化 OpenTelemetry，返回清理函数
+shutdown := log.InitTracer("my-service")
 defer shutdown()
 ```
 
@@ -162,18 +204,18 @@ notice.SendNoticeNotify(ctx, "标题", "内容")
 ```go
 import "github.com/bpshou/tituskit/core/rester"
 
-// 使用默认客户端（300s 超时，3 次重试）
-resp, err := rester.GetRequest("https://api.example.com/data", nil, nil)
+// 使用默认客户端（300s 超时，3 次重试），GetRequest 不接受参数
+resp, err := rester.GetRequest().Get("https://api.example.com/data")
 
-// 自定义客户端
-client := rester.NewClient(rester.ClientConfig{
-    Timeout: 10 * time.Second,
-    Retry:   2,
-})
-resp, err = client.GetRequest("https://api.example.com/data", nil, nil)
+// 自定义客户端：Timeout/RetryCount 等字段必须在第一次请求之前设置，
+// 配置只在首次使用时生效一次；需要多套配置就用多个 New()。
+client := rester.New()
+client.Timeout = 10 * time.Second
+client.RetryCount = 2
+resp, err = client.GetRequest().Get("https://api.example.com/data")
 
-// SSE 流式请求
-resp, err = rester.GetSSERequest("https://api.example.com/stream", nil, nil)
+// SSE 流式请求（内部 SetResponseDoNotParse(true)）
+resp, err = rester.GetSSERequest().Get("https://api.example.com/stream")
 ```
 
 ### Tmpl
@@ -184,11 +226,37 @@ resp, err = rester.GetSSERequest("https://api.example.com/stream", nil, nil)
 import "github.com/bpshou/tituskit/core/tmpl"
 
 engine := tmpl.NewGenEngine()
-engine.AddTemplate("user", "./templates/user.gotmpl")
-engine.GenCode(os.Stdout, "user", map[string]interface{}{
+
+if err := engine.AddTemplate("user", "./templates/user.gotmpl"); err != nil {
+    log.Fatalf("加载模板失败: %v", err)
+}
+
+// 出错返回 error，不会终止宿主进程；writer 传 nil 时写 os.Stdout
+if err := engine.GenCode(os.Stdout, "user", map[string]any{
     "Name": "张三",
     "Age":  25,
-})
+}); err != nil {
+    log.Fatalf("渲染模板失败: %v", err)
+}
+```
+
+### gin/resp
+
+Gin 的统一响应封装，提供两套响应体格式。
+
+```go
+import "github.com/bpshou/tituskit/gin/resp"
+
+// Format A：Web 前端统一响应 {"code":0,"message":"ok","data":...}
+resp.Success(c, "ok", gin.H{"id": 1})
+resp.Error(c, http.StatusBadRequest, 40001, "参数错误")
+
+// Format B：OpenAI 兼容错误体 {"error":{"message":"...","type":"..."}}
+// 注意 AbortWithError 的参数顺序是 (状态码, errorType, message)
+resp.BadRequest(c, "missing field: model")   // 400 invalid_request_error
+resp.Unauthorized(c, "invalid api key")      // 401 invalid_request_error
+resp.RateLimit(c)                            // 429 rate_limit_error
+resp.TokenExhausted(c)                       // 429 insufficient_quota
 ```
 
 ## 目录结构
@@ -199,10 +267,13 @@ core/
 ├── config/         # 配置加载
 ├── crontab/        # 定时任务
 ├── db/             # 数据库
+├── deploader/      # 依赖加载
 ├── log/            # 日志与追踪
 ├── notice/         # 桌面通知
 ├── rester/         # HTTP 客户端
 └── tmpl/           # 模板引擎
+gin/
+└── resp/           # Gin 统一响应
 ```
 
 ## License

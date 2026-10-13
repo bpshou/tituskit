@@ -8,18 +8,33 @@ import (
 	"github.com/google/uuid"
 )
 
+// Jwt 是 JWT 签发与解析器。签名算法固定为 HS256。
 type Jwt[T any] struct {
 	Issuer     string
 	SigningKey []byte
-	Claims     *T
 }
 
-func NewJwt[T any](jwt Jwt[T]) *Jwt[T] {
+// NewJwt 创建 Jwt 实例
+func NewJwt[T any](cfg Jwt[T]) *Jwt[T] {
 	return &Jwt[T]{
-		Issuer:     jwt.Issuer,
-		SigningKey: jwt.SigningKey,
-		Claims:     jwt.Claims,
+		Issuer:     cfg.Issuer,
+		SigningKey: cfg.SigningKey,
 	}
+}
+
+// parseOptions 返回解析时统一使用的校验选项。
+//
+// 必须用 WithValidMethods 固定签名算法：keyfunc 只返回 SigningKey、不看
+// token.Method，不锁定算法的话 HS384/HS512 等同族算法签发的 token 也会被接受。
+// Issuer 非空时一并校验，避免接受其它签发方签发的 token。
+func (j *Jwt[T]) parseOptions() []jwt.ParserOption {
+	opts := []jwt.ParserOption{
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+	}
+	if j.Issuer != "" {
+		opts = append(opts, jwt.WithIssuer(j.Issuer))
+	}
+	return opts
 }
 
 // 签发token
@@ -40,9 +55,9 @@ func (j *Jwt[T]) GenerateJwtToken(subject string, audience []string, ttl time.Du
 
 // 解析token
 func (j *Jwt[T]) ParseJwtToken(tokenString string) (string, []string, error) {
-	jwtToken, err := jwt.Parse(tokenString, func(token *jwt.Token) (i interface{}, e error) {
+	jwtToken, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		return j.SigningKey, nil
-	})
+	}, j.parseOptions()...)
 	if err != nil {
 		return "", nil, err
 	}
@@ -94,9 +109,12 @@ func (j *Jwt[T]) ParseJwtTokenWithClaims(tokenString string, claims *T) (jwt.Cla
 	}
 	token, err := jwt.ParseWithClaims(tokenString, jwtClaims, func(token *jwt.Token) (interface{}, error) {
 		return j.SigningKey, nil
-	})
+	}, j.parseOptions()...)
 	if err != nil {
 		return nil, err
+	}
+	if !token.Valid {
+		return nil, errors.New("jwt token invalid")
 	}
 	return token.Claims, nil
 }

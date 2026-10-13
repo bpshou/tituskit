@@ -232,59 +232,86 @@ func TestLoad_NilFunction(t *testing.T) {
 }
 
 func TestLoad_SelfDependency(t *testing.T) {
-	// 自依赖不会被校验拦截，会在 goroutine 内等待自身导致永久阻塞（死锁）
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		Load([]Module{
-			{Name: "a", Fn: func() {}, Deps: []string{"a"}},
-		})
+	// 自依赖是环的一种，在启动任何 goroutine 之前就被检出并 panic，
+	// 而不是让 goroutine 等待自身造成永久死锁。
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for self dependency")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("expected string panic, got %T: %v", r, r)
+		}
+		if msg != "deploader: cyclic dependency: a -> a" {
+			t.Fatalf("unexpected panic message: %s", msg)
+		}
 	}()
 
-	select {
-	case <-done:
-		t.Fatal("expected deadlock for self dependency, but Load returned")
-	case <-time.After(100 * time.Millisecond):
-		// 预期：goroutine 阻塞等待自身
-	}
+	Load([]Module{
+		{Name: "a", Fn: func() {}, Deps: []string{"a"}},
+	})
 }
 
 func TestLoad_CyclicDependency(t *testing.T) {
-	t.Run("two-node cycle", func(t *testing.T) {
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			Load([]Module{
-				{Name: "a", Fn: func() {}, Deps: []string{"b"}},
-				{Name: "b", Fn: func() {}, Deps: []string{"a"}},
-			})
-		}()
-
-		select {
-		case <-done:
-			t.Fatal("expected deadlock for cyclic dependency, but Load returned")
-		case <-time.After(100 * time.Millisecond):
-			// expected: goroutines blocked waiting on each other
+	assertCyclePanic := func(t *testing.T, want string) {
+		t.Helper()
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for cyclic dependency")
 		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("expected string panic, got %T: %v", r, r)
+		}
+		if msg != want {
+			t.Fatalf("unexpected panic message: %s (want %s)", msg, want)
+		}
+	}
+
+	t.Run("two-node cycle", func(t *testing.T) {
+		defer assertCyclePanic(t, "deploader: cyclic dependency: a -> b -> a")
+
+		Load([]Module{
+			{Name: "a", Fn: func() {}, Deps: []string{"b"}},
+			{Name: "b", Fn: func() {}, Deps: []string{"a"}},
+		})
 	})
 
 	t.Run("three-node cycle", func(t *testing.T) {
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			Load([]Module{
-				{Name: "a", Fn: func() {}, Deps: []string{"b"}},
-				{Name: "b", Fn: func() {}, Deps: []string{"c"}},
-				{Name: "c", Fn: func() {}, Deps: []string{"a"}},
-			})
+		defer assertCyclePanic(t, "deploader: cyclic dependency: a -> b -> c -> a")
+
+		Load([]Module{
+			{Name: "a", Fn: func() {}, Deps: []string{"b"}},
+			{Name: "b", Fn: func() {}, Deps: []string{"c"}},
+			{Name: "c", Fn: func() {}, Deps: []string{"a"}},
+		})
+	})
+
+	t.Run("cycle is detected before any module runs", func(t *testing.T) {
+		var called bool
+		defer func() {
+			recover()
+			if called {
+				t.Fatal("expected no module to run when the graph has a cycle")
+			}
 		}()
 
-		select {
-		case <-done:
-			t.Fatal("expected deadlock for cyclic dependency, but Load returned")
-		case <-time.After(100 * time.Millisecond):
-			// expected
-		}
+		Load([]Module{
+			{Name: "a", Fn: func() { called = true }, Deps: []string{"b"}},
+			{Name: "b", Fn: func() { called = true }, Deps: []string{"a"}},
+		})
+		t.Fatal("expected panic for cyclic dependency")
+	})
+
+	t.Run("cycle in a subgraph of an otherwise valid graph", func(t *testing.T) {
+		defer assertCyclePanic(t, "deploader: cyclic dependency: b -> c -> b")
+
+		Load([]Module{
+			{Name: "a", Fn: func() {}},
+			{Name: "b", Fn: func() {}, Deps: []string{"a", "c"}},
+			{Name: "c", Fn: func() {}, Deps: []string{"b"}},
+		})
 	})
 }
 

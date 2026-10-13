@@ -34,7 +34,7 @@ func Error(c *gin.Context, httpStatus int, code int, message string) {
 	})
 }
 
-// Result returns an arbitrary HTTP status with a custom code and message.
+// Result writes a caller-built Response envelope with an arbitrary HTTP status.
 func Result(c *gin.Context, httpStatus int, res Response) {
 	c.JSON(httpStatus, res)
 }

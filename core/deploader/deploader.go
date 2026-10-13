@@ -2,6 +2,7 @@ package deploader
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -12,7 +13,11 @@ type Module struct {
 	Deps []string
 }
 
-// Load 依据 Module.Deps 拓扑排序并发执行各模块，校验依赖名合法性
+// Load 依据 Module.Deps 拓扑排序并发执行各模块。
+//
+// 加载前会校验依赖图，以下三种非法输入直接 panic：模块名重复、依赖了不存在
+// 的模块、依赖成环（含自依赖）。成环若放任不管，相关 goroutine 会互相等待到
+// 永久死锁、Load 永不返回，因此与另外两种错误一样尽早失败。
 func Load(modules []Module) {
 	names := make(map[string]bool, len(modules))
 	for _, m := range modules {
@@ -28,6 +33,10 @@ func Load(modules []Module) {
 				panic(fmt.Sprintf("deploader: module %q depends on unknown module %q", m.Name, dep))
 			}
 		}
+	}
+
+	if cycle := findCycle(modules); len(cycle) > 0 {
+		panic("deploader: cyclic dependency: " + strings.Join(cycle, " -> "))
 	}
 
 	done := make(map[string]chan struct{})

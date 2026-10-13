@@ -3,6 +3,13 @@ package log
 import (
 	"io"
 	"log/slog"
+	"os"
+)
+
+// 日志输出格式。
+const (
+	FormatJSON = "json"
+	FormatText = "text"
 )
 
 type Config struct {
@@ -11,15 +18,25 @@ type Config struct {
 	IoWriter io.Writer `json:"io_writer"`
 }
 
-// 创建 slog.Logger
+// New 创建 slog.Logger。
+//
+// IoWriter 为 nil 时默认写入 os.Stdout：slog 的 Handler 会原样保存这个
+// Writer，真正写日志时才调用它的 Write，传入 nil 接口会在首次打日志时
+// panic（invalid memory address），因此这里必须兜底。
+//
+// Format 为 FormatJSON 时输出 JSON，其余值输出 Text。
 func New(config Config) *slog.Logger {
+	if config.IoWriter == nil {
+		config.IoWriter = os.Stdout
+	}
+
 	opts := &slog.HandlerOptions{
 		AddSource: true,
 		Level:     ParseLevel(config.Level),
 	}
 
 	var handler slog.Handler
-	if config.Format == "json" {
+	if config.Format == FormatJSON {
 		handler = NewHandler(slog.NewJSONHandler(config.IoWriter, opts))
 	} else {
 		handler = NewHandler(slog.NewTextHandler(config.IoWriter, opts))
